@@ -16,7 +16,9 @@
 /* Externally Defined Variables	*/
 extern ade7912_capture_mode_t adc_mode;
 extern dpt_system_t system_data;
-extern tmSchedule_t pump_schedule[NUM_WEEKDAYS];
+extern int gPumpScheduleStartTime;
+extern int gPumpScheduleStopTime;
+extern uint8_t gPumpState;
 
 #define	  C_BMP180_ONE_U8X			((u8)1)
 
@@ -182,7 +184,7 @@ void bmp180_sensor_data(struct bmp180_data_t *bmp180_sensor_data)
 *	device address with global structure bmp180_t
 *-------------------------------------------------------------------------*/
 s8 I2C_routine(void) {
-/*--------------------------------------------------------------------------*
+/*--------------------------------------------------------------system_data-----------*
  *  By using bmp180 the following structure parameter can be accessed
  *	Bus write function pointer: BMP180_WR_FUNC_PTR
  *	Bus read function pointer: BMP180_RD_FUNC_PTR
@@ -269,21 +271,6 @@ void delay_ms(u32 msec)
 		mgos_usleep(1000);
 }
 
-
-/*
- * getDefaultSchedule: Initialize structure with pump default
- * schedule
- *
- */
-void getDefaultSchedule(tmSchedule_t *schedule){
-
-	schedule->tm_hour_start = 5;	// 6am
-	schedule->tm_min_start = 0;
-	schedule->tm_hour_end = 8;		// 8am
-	schedule->tm_min_end = 0;
-}
-
-
 /*
  * deviceInit: Configures peripherals used
  *
@@ -309,17 +296,7 @@ void deviceInit(void)
 	adc1_config_channel_atten(ADC1_CHANNEL_5, ADC_ATTEN_6db);
 
 	// Initialize Pump Schedule
-	if (!getPumpSchedule()) {
-		// This is a virgin board with no pump schedule
-		LOG(LL_INFO, ("Creating default schedule..."));
-		for (uint8_t i=0; i<NUM_WEEKDAYS; i++) {
-			pump_schedule[i].tm_wday = i;
-			getDefaultSchedule(&pump_schedule[i]);
-		}
-		// Save default schedule file
-		savePumpSchedule();
-		LOG(LL_INFO, ("Saved Schedule file %s\n", "pump_schedule.txt"));
-	}
+	getPumpSchedule();
 }
 
 /*
@@ -329,14 +306,18 @@ void deviceInit(void)
 uint8_t cmdPumpOnOff(relay_status_t cmd)
 {
 	if (adc_mode == eMEASURE) {
-		if (cmd)
+		if (cmd) {
 			mgos_gpio_write(RELAY_DRV_GPIO, eRELAY_ON);
-		else
+			LOG(LL_DEBUG, ("Turning Pump On\n"));
+		}
+		else {
 			mgos_gpio_write(RELAY_DRV_GPIO, eRELAY_OFF);
+			LOG(LL_DEBUG, ("Turning Pump Off\n"));
+		}
+		gPumpState = cmd;
 		// Give relay sometime to switch
 		mgos_usleep(5000);
 	}
-
     return mgos_gpio_read(RELAY_DRV_GPIO);
 }
 
@@ -344,41 +325,89 @@ uint8_t cmdPumpOnOff(relay_status_t cmd)
  * savePumpSchedule: Save Pump Schedule
  *
  */
-bool savePumpSchedule(void)
+void savePumpSchedule(void)
 {
-	FILE *fp;
-	size_t size_of_elements = sizeof(pump_schedule[0]);
-	size_t number_of_elements = sizeof(pump_schedule)/size_of_elements;
+	char dtString[100] = {'\0'};
+	struct tm startTime = *(localtime((time_t *)&system_data.schedule.tm_start));
+	struct tm stopTime = *(localtime((time_t *)&system_data.schedule.tm_stop));
 
-	fp = fopen("pump_schedule.txt", "wb");
+	strftime(dtString, 100, "%a, %x - %I:%M%p", &startTime);
+	LOG(LL_INFO, ("Schedule Start time %s\n", dtString));
+	strftime(dtString, 100, "%a, %x - %I:%M%p", &stopTime);
+	LOG(LL_INFO, ("Schedule Stop time %s\n", dtString));
+	gPumpScheduleStartTime = startTime.tm_hour*3600 + startTime.tm_min*60 + startTime.tm_sec;
+	gPumpScheduleStopTime = stopTime.tm_hour*3600 + stopTime.tm_min*60 + stopTime.tm_sec;
+	LOG(LL_INFO, ("start time secs: %d, stop time secs: %d\n", gPumpScheduleStartTime, gPumpScheduleStopTime));
 
-	if (fp == NULL)
-		return false;
+	mgos_sys_config_set_spt_schedule_start(system_data.schedule.tm_start);
+	mgos_sys_config_set_spt_schedule_stop(system_data.schedule.tm_stop);
 
-	fwrite(&pump_schedule, size_of_elements, number_of_elements, fp);
-	LOG(LL_DEBUG, ("Wrote %d bytes\n", number_of_elements*size_of_elements));
-
-    return true;
+	char *err = NULL;
+  	save_cfg(&mgos_sys_config, &err); /* Writes conf9.json */
+	LOG(LL_DEBUG, ("Saving configuration: %s\n", err ? err : "no error"));
+  	free(err);
 }
 
 
 /*
- * getPumpSchedule: Save Pump Schedule
+ * getPumpSchedule: Get Pump Schedule
  *
  */
-bool getPumpSchedule(void)
+void getPumpSchedule(void)
 {
-	FILE *fp;
-	size_t size_of_elements = sizeof(pump_schedule[0]);
-	size_t number_of_elements = sizeof(pump_schedule)/size_of_elements;
+	system_data.schedule.tm_start = mgos_sys_config_get_spt_schedule_start();
+	system_data.schedule.tm_stop = mgos_sys_config_get_spt_schedule_stop();
 
-	fp = fopen("pump_schedule.txt", "rb");
+	char dtString[100] = {'\0'};
+	struct tm startTime = *(localtime((time_t *)&system_data.schedule.tm_start));
+	struct tm stopTime = *(localtime((time_t *)&system_data.schedule.tm_stop));
 
-	if (fp == NULL)
-		return false;
-
-	fread(&pump_schedule, size_of_elements, number_of_elements, fp);
-	LOG(LL_DEBUG, ("Read %d bytes\n", number_of_elements*size_of_elements));
-
-    return true;
+	strftime(dtString, 100, "%a, %x - %I:%M%p", &startTime);
+	LOG(LL_INFO, ("Schedule Start time %s\n", dtString));
+	strftime(dtString, 100, "%a, %x - %I:%M%p", &stopTime);
+	LOG(LL_INFO, ("Schedule Stop time %s\n", dtString));
+	gPumpScheduleStartTime = startTime.tm_hour*3600 + startTime.tm_min*60 + startTime.tm_sec;
+	gPumpScheduleStopTime = stopTime.tm_hour*3600 + stopTime.tm_min*60 + stopTime.tm_sec;
 }
+
+
+
+/*
+ * savePumpTimer: Save Pump Timer
+ *
+ */
+void savePumpTimer(void)
+{
+	mgos_sys_config_set_spt_timer_start(system_data.timer.tm_start);
+	mgos_sys_config_set_spt_timer_stop(system_data.timer.tm_stop);
+
+	char *err = NULL;
+  	save_cfg(&mgos_sys_config, &err); /* Writes conf9.json */
+	LOG(LL_DEBUG, ("Saving configuration: %s\n", err ? err : "no error"));
+  	free(err);
+}
+
+
+/*
+ * getPumpTimer: Get Pump Timer
+ *
+ */
+void getPumpTimer(void)
+{
+	system_data.timer.tm_start = mgos_sys_config_get_spt_timer_start();
+	system_data.timer.tm_stop = mgos_sys_config_get_spt_timer_stop();
+}
+
+/*
+ * getStationIP: Returns IP Address of Station interface
+ *
+ */
+void getStationIP(char *sta_ip)
+{
+  	struct mgos_net_ip_info ip_info;
+
+	if (mgos_net_get_ip_info(MGOS_NET_IF_TYPE_WIFI, MGOS_NET_IF_WIFI_STA, &ip_info)) {
+    	mgos_net_ip_to_str(&ip_info.ip, sta_ip);	
+	}
+}
+

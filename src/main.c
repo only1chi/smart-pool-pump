@@ -7,19 +7,26 @@
 
 #include <stdio.h>
 #include "smartpooltmr.h"
-#include "mgos_aws_shadow.h"
 #include "mgos_http_server.h"
+#include "mgos_wifi.h"
 
 /* Global variables	*/
 char *msg = "This is a message";
-struct sys_config *device_cfg;
+struct mgos_config *device_cfg;
 dpt_system_t system_data;
-tmSchedule_t pump_schedule[NUM_WEEKDAYS];
 bool gADCConfigured = false;
+bool gTimeSynced = false;
+bool gSaveSchedule = false;
+bool gTimerEnable = false;
+int gPumpScheduleStartTime = 0;
+int gPumpScheduleStopTime = 0;
+uint8_t gPumpState = false;
+
+/* Request URI for getting IP as recognized from an external location */
+static char *getIP_url = "https://api.ipify.org";
 
 /* Definitions 	*/
 #define MGOS_F_RELOAD_CONFIG MG_F_USER_5
-
 
 static struct device_settings s_settings = {"ssid", "password"};
 
@@ -29,7 +36,8 @@ static struct device_settings s_settings = {"ssid", "password"};
  *
  */
 static void handle_save(struct mg_connection *nc, struct http_message *hm) {
-  struct sys_config_wifi_sta device_cfg_sta;
+  // struct sys_config_wifi_sta device_cfg_sta;
+  struct mgos_config_wifi_sta device_cfg_sta;
 
   memset(&device_cfg_sta, 0, sizeof(device_cfg_sta));
 
@@ -71,12 +79,15 @@ static void handle_save(struct mg_connection *nc, struct http_message *hm) {
 static void handle_get_cpu_usage(struct mg_connection *nc) {
 
 	int cpu_usage = 0;
+  char sta_ip[16];
 	struct mbuf fb;
 	struct json_out fout = JSON_OUT_MBUF(&fb);
 	mbuf_init(&fb, 256);
+  memset(sta_ip, 0, sizeof(sta_ip));
 
+	getStationIP(sta_ip);
 	cpu_usage = ((double)mgos_get_free_heap_size()/(double)mgos_get_heap_size()) * 100.0;
-	json_printf(&fout, STATUS_FMT, cpu_usage, mgos_wifi_get_connected_ssid(), mgos_wifi_get_sta_ip());
+	json_printf(&fout, STATUS_FMT, cpu_usage, mgos_wifi_get_connected_ssid(), sta_ip);
     mbuf_trim(&fb);
 
 	struct mg_str f = mg_mk_str_n(fb.buf, fb.len);	/* convert to string	*/
@@ -109,13 +120,12 @@ static void handle_ssi_call(struct mg_connection *nc, const char *param) {
 
 /*
  * Event Handler for http post events "/save"
- *
+ * 
  */
 static void http_post_ev_handler(struct mg_connection *nc, int ev, void *ev_data, void *user_data) {
   struct http_message *hm = (struct http_message *) ev_data;
 
   printf("Event: %d, uri: %s\n", ev, hm->uri.p);
-
   switch (ev) {
     case MG_EV_HTTP_REQUEST:
       if (mg_vcmp(&hm->uri, "/save") == 0) {
@@ -160,32 +170,107 @@ static void http_get_ev_handler(struct mg_connection *nc, int ev, void *ev_data,
 }
 
 
-/**
+/*
+ * Event Handler for http client events
+ * 
+ * Events. Meaning of event parameter (evp) is given in the comment.
+ * #define MG_EV_POLL 0    Sent to each connection on each mg_mgr_poll() call 
+ * #define MG_EV_ACCEPT 1  New connection accepted. union socket_address 
+ * #define MG_EV_CONNECT 2 connect() succeeded or failed. int * 
+ * #define MG_EV_RECV 3    Data has been received. int *num_bytes
+ * #define MG_EV_SEND 4    Data has been written to a socket. int *num_bytes 
+ * #define MG_EV_CLOSE 5   Connection is closed. NULL 
+ * #define MG_EV_TIMER 6 now >= conn->ev_timer_time. double * 
+ * 
+ */
+static void http_client_ev_handler(struct mg_connection *nc, int ev, void *ev_data, void *user_data) {
+  struct http_message *hm;
+	int connect_status;
+
+  LOG(LL_INFO, ("Event: %d\n", ev));
+
+
+  switch (ev) {
+    case MG_EV_CONNECT:
+			connect_status = *(int *) ev_data;
+      if (connect_status != 0) {
+			  LOG(LL_INFO, ("Error connecting to %s: %s\n", getIP_url, strerror(connect_status)));
+			}
+			else {
+			  LOG(LL_INFO, ("Connected to %s: %s\n", getIP_url, strerror(connect_status)));
+			}
+      break;
+
+    case MG_EV_HTTP_REPLY:
+		 	hm = (struct http_message *) ev_data;
+			LOG(LL_INFO, ("Response Code:\n %d, %s\n", (int) hm->resp_code, hm->resp_status_msg.p));
+			LOG(LL_INFO, ("Got reply:\n%d, %s\n", (int) hm->body.len, hm->body.p));
+			memset(system_data.ip, '\0', 16);
+			if ((int) hm->body.len < 16) {
+				strncpy(system_data.ip, hm->body.p, (int) hm->body.len);
+			}	else {
+				strncpy(system_data.ip, hm->body.p,16);
+			}
+			// while (1);
+      // nc->flags |= MG_F_SEND_AND_CLOSE;
+      nc->flags |= MG_F_CLOSE_IMMEDIATELY;
+      break;
+		
+    case MG_EV_CLOSE:
+			// if (s_exit_flag == 0) {
+			  LOG(LL_INFO, ("Connection closed\n"));
+			// }
+      break;
+
+    default:
+      break;
+  }
+	(void) user_data;
+}
+
+/*
+ * http_client_connect_event: Configures http client connection
+ * net_ev_handler
+ *
+ * mg_connect_http(mgr, event_handler_t event_handler, const char *url, 
+ *                  const char *extra_headers, const char *post_data)
+ * 
+ * struct mg_connection *mgos_connect_http(const char *addr, mg_event_handler_t,
+ *																					void *ud);
+ */
+
+static void http_client_connect_event(int ev, void *evd, void *arg) {
+
+  LOG(LL_INFO, ("== Net Event: %d\n", ev));
+  if (ev == MGOS_NET_EV_IP_ACQUIRED) {
+    LOG(LL_INFO, ("Just got IP!"));
+		LOG(LL_INFO, ("Starting http client against %s\n", getIP_url));
+
+    /* initiate an http client connection request	*/
+		// mgos_connect_http(getIP_url, http_client_ev_handler, NULL);
+		// mg_connect_http(mgos_get_mgr(), http_client_ev_handler, NULL, getIP_url, NULL, NULL);
+		mg_connect_http(mgos_get_mgr(), http_client_ev_handler, NULL, getIP_url, NULL, NULL);
+	}
+ }
+
+
+
+/*
  * Become a station connecting to an existing access point.
  */
-void becomeStation(struct sys_config_wifi_sta *device_cfg_sta) {
-	struct sys_config_wifi_sta *wifi_sta;
+void becomeStation(struct mgos_config_wifi_sta *device_cfg_sta) {
 
-	/* get current config settings	*/
-	device_cfg = get_cfg();
-	wifi_sta = &device_cfg->wifi.sta;
-	LOG(LL_DEBUG, ("Getting config at address\n"));
+	mgos_sys_config_set_wifi_sta_ssid(device_cfg_sta->ssid);
+	mgos_sys_config_set_wifi_sta_pass(device_cfg_sta->pass);
+	mgos_sys_config_set_wifi_sta_enable(true);
+	mgos_sys_config_set_mqtt_enable(true);
 
-	wifi_sta->ssid = device_cfg_sta->ssid;
-	wifi_sta->pass = device_cfg_sta->pass;
-	wifi_sta->enable = true;
-	device_cfg->wifi.sta = *wifi_sta;
-	device_cfg->mqtt.enable = true;
 	LOG(LL_DEBUG, ("Device config set SSID = %s, Password = %s \n", device_cfg_sta->ssid, device_cfg_sta->pass));
 
-	if (save_cfg(device_cfg, &msg)) {
-		LOG(LL_DEBUG, ("SUCCESS: Saved Config. System Restarting... \n"));
-		mgos_wifi_setup_sta(&device_cfg->wifi.sta);
-//		mgos_system_restart(0);
-	}
-	else {
-		LOG(LL_DEBUG, ("FAIL: %s\n", msg));
-	}
+	char *err = NULL;
+  save_cfg(&mgos_sys_config, &err); /* Writes conf9.json */
+	LOG(LL_DEBUG, ("Saving configuration: %s\n", err ? err : "no error"));
+  free(err);
 
 	(void)device_cfg_sta;
 } // becomeStation
@@ -197,31 +282,13 @@ void becomeStation(struct sys_config_wifi_sta *device_cfg_sta) {
  */
 
 void report_state(void) {
-  struct mbuf fb;
-  struct json_out fout = JSON_OUT_MBUF(&fb);
-  mbuf_init(&fb, 256);
 
-  json_printf(&fout, JSON_EPOOLTIMER_FMT, system_data.pump_voltage, system_data.pump_current, system_data.pump_power,
-		  system_data.box_temperature, system_data.box_pressure, system_data.manOverride, system_data.pumpCmd);
-
-  mbuf_trim(&fb);
-
-//  LOG(LL_INFO, ("== Reporting state: %s", fb.buf));
-  mgos_aws_shadow_updatef(0, "{reported:" JSON_EPOOLTIMER_FMT "}", system_data.pump_voltage, system_data.pump_current, system_data.pump_power,
-		  system_data.box_temperature, system_data.box_pressure, system_data.manOverride, system_data.pumpCmd);
-
-  mbuf_free(&fb);
+  mgos_shadow_updatef(0, JSON_SPOOLTIMER_FMT, system_data.pump_voltage, system_data.pump_current, system_data.pump_power,
+		  																				system_data.box_temperature, system_data.box_pressure, system_data.manOverride, 
+																							system_data.pumpCmd, system_data.timer.tm_start, system_data.timer.tm_stop,
+	 																						system_data.schedule.tm_start, system_data.schedule.tm_stop, system_data.ip);
 }
 
-
-/*
- * update_state. This commands pump on/off
- *
- */
-void update_state(void) {
-  cmdPumpOnOff(system_data.pumpCmd);
-  LOG(LL_INFO, ("Relay: %d\n", system_data.pumpCmd));
-}
 
 /*
  * Main AWS Device Shadow state callback handler. Will get invoked when
@@ -229,53 +296,56 @@ void update_state(void) {
  *
  * CONNECTED event comes with no state.
  *
- * For DELTA events, state is passed as "desired", reported is not set.
+ *
  *
  */
-static void aws_shadow_state_handler(void *arg, enum mgos_aws_shadow_event ev,
-                                     uint64_t version,
-                                     const struct mg_str reported,
-                                     const struct mg_str desired,
-                                     const struct mg_str reported_md,
-                                     const struct mg_str desired_md) {
+static void shadow_state_cb(int ev, void *ev_data, void *userdata) {
+  struct mg_str data = *(struct mg_str *) ev_data;
+	// int result;
 
-  dpt_system_t tempSystemData;
+  LOG(LL_DEBUG, ("== Shadow Event: %d (%s)", ev, mgos_shadow_event_name(ev)));
 
-  LOG(LL_INFO, ("== Event: %d (%s), version: %llu", ev,
-                mgos_aws_shadow_event_name(ev), version));
-
-  if (ev == MGOS_AWS_SHADOW_CONNECTED) {
+  if (ev == MGOS_SHADOW_CONNECTED) {
     report_state();
     return;
   }
-  if (ev != MGOS_AWS_SHADOW_GET_ACCEPTED &&
-      ev != MGOS_AWS_SHADOW_UPDATE_DELTA) {
+
+  if (ev != MGOS_SHADOW_GET_ACCEPTED &&
+      ev != MGOS_SHADOW_UPDATE_DELTA) {
     return;
   }
-  LOG(LL_INFO, ("Reported state: %.*s\n", (int) reported.len, reported.p));
-  LOG(LL_INFO, ("Desired state : %.*s\n", (int) desired.len, desired.p));
-  LOG(LL_INFO, ("Reported metadata: %.*s\n", (int) reported_md.len, reported_md.p));
-  LOG(LL_INFO, ("Desired metadata : %.*s\n", (int) desired_md.len, desired_md.p));
-  /*
-   * Here we extract values from previously reported state (if any)
-   * and then override it with desired state (if present).
-   */
-  json_scanf(reported.p, reported.len, JSON_EPOOLTIMER_FMT, &tempSystemData.pump_voltage, &tempSystemData.pump_current,
-		  	  	  	  	  	  	  	  	  	  	  	  	  	&tempSystemData.pump_power, &tempSystemData.box_temperature,
-															&tempSystemData.box_pressure, &tempSystemData.manOverride,
-															&tempSystemData.pumpCmd);
 
-  json_scanf(desired.p, desired.len, JSON_EPOOLTIMER_FMT, &tempSystemData.pump_voltage, &tempSystemData.pump_current,
-  	  	  	  	  	  										&tempSystemData.pump_power, &tempSystemData.box_temperature,
-															&tempSystemData.box_pressure, &tempSystemData.manOverride,
-															&system_data.pumpCmd);
+  if (ev_data == NULL) {
+    return;
+  }
+  
+  data = *(struct mg_str *) ev_data;
 
-  update_state();
-  if (ev == MGOS_AWS_SHADOW_UPDATE_DELTA) {
+  LOG(LL_INFO, ("state : %.*s\n",  (int) data.len, data.p));
+
+	/* Update object elements if found 	*/
+  if (json_scanf(data.p, data.len, JSON_RELAY_FMT, &system_data.pumpCmd) > 0)
+	{
+		cmdPumpOnOff(system_data.pumpCmd);
+  	LOG(LL_INFO, ("Relay: %d\n", system_data.pumpCmd));
+	}
+
+  if (json_scanf(data.p, data.len, JSON_TIMER_FMT, &system_data.timer.tm_start, &system_data.timer.tm_stop) > 0)
+	{
+		gTimerEnable = true;
+	}
+	
+  if(json_scanf(data.p, data.len, JSON_SCHEDULE_FMT, &system_data.schedule.tm_start, &system_data.schedule.tm_stop) > 0)
+	{
+		gSaveSchedule = true;
+	}
+
+  if (ev == MGOS_SHADOW_UPDATE_DELTA) {
     report_state();
   }
-  (void) arg;
+  (void) userdata;                                     
 }
+
 
 /*
  * periodicCallBackHandler: Function called periodically which updates system
@@ -297,13 +367,14 @@ static void periodicCallBackHandler(void *arg) {
 	system_data.manOverride = mgos_gpio_read(MANUAL_OVRD_GPIO);
 	system_data.upTime = mgos_uptime();
 
-	LOG(LL_INFO, ("system_data.dc_input_voltage = %.2f", system_data.dc_input_voltage));
-	LOG(LL_INFO, ("system_data.upTime = %lf", system_data.upTime));
+	LOG(LL_DEBUG, ("system_data.dc_input_voltage = %.2f", system_data.dc_input_voltage));
+	LOG(LL_DEBUG, ("system_data.upTime = %lf", system_data.upTime));
 
-	/* Send updates to shadow	*/
-//	report_state();
+	/* check pump schedule and turn on pump */
+	if (!gTimeSynced) {
+		syncTime();
+	}
 
-	checkPumpSchedule();
 	(void)arg;
 }
 
@@ -327,8 +398,40 @@ static void measurePumpTask(void *arg) {
 			LOG(LL_DEBUG, ("system_data.pump_power = %.2f\n", system_data.pump_power));
 		}
 	}
+
+	checkPumpSchedule();	/* Calling this function here so that it can be executed within this task	*/
+
 	(void)arg;
 }
+
+
+/*
+ * syncTime: Function synchronizes timer and schedule to local time
+ * 					 depends on sntp
+ *
+ */
+void syncTime(void) {
+
+	char dtString[100] = {'\0'};
+
+	struct timezone tzEST;
+	struct timeval timeNow;
+	gettimeofday(&timeNow, &tzEST);
+	struct tm *dateAndTime = localtime(&timeNow.tv_sec);
+
+	if (ISTIMESYNCED(dateAndTime->tm_year)) {
+		strftime(dtString, 100, "%a, %x - %I:%M%p", dateAndTime);
+		LOG(LL_INFO, ("Local time %s, daylight_savings: %d\n", dtString, dateAndTime->tm_isdst));
+
+		/* Restore schedule/timer information	*/
+		getPumpTimer();
+		getPumpSchedule();
+
+		gTimeSynced = true;
+	}
+
+}
+
 
 /*
  * checkPumpSchedule: Function determines date and time
@@ -336,28 +439,39 @@ static void measurePumpTask(void *arg) {
  *
  */
 void checkPumpSchedule(void) {
-	/* TODO
-	 * Figure out how to get create a schedule for turning pump on off
-	 */
-	char dtString[100] = {'\0'};
-
 	struct timezone tzEST;
 	struct timeval timeNow;
 	gettimeofday(&timeNow, &tzEST);
 	struct tm *dateAndTime = localtime(&timeNow.tv_sec);
 	time_t local_ts = mktime(dateAndTime);
+	
+	
+	int currentTime = dateAndTime->tm_hour*3600 + dateAndTime->tm_min*60 + dateAndTime->tm_sec;
 
-	if (ISTIMESYNCED(dateAndTime->tm_year)) {
-//		mgos_strftime(dtString, 100, "%a, %x - %I:%M%p", timeNow.tv_sec);
-		if (dateAndTime->tm_isdst == 1) {
-			local_ts += (TIME_ZONE_EST-1)*3600;
+	/* Ensure timer is enabled */
+	if(gTimerEnable) {
+		if ((local_ts >= system_data.timer.tm_start) && (local_ts <= system_data.timer.tm_stop)) {
+			cmdPumpOnOff(true);
 		}
 		else {
-			local_ts += TIME_ZONE_EST*3600;
+			cmdPumpOnOff(false);
+			gTimerEnable = false;
 		}
-		dateAndTime=localtime(&local_ts);
-		strftime(dtString, 100, "%a, %x - %I:%M%p", dateAndTime);
-		LOG(LL_DEBUG, ("Local time %s, daylight_savings: %d\n", dtString, dateAndTime->tm_isdst));
+	}
+
+	if (gSaveSchedule) {
+		savePumpSchedule();		// Assumes schedule/time information is in UTC
+		gSaveSchedule = false;
+ 	}
+
+	/* Ensure Schedule is synced	*/
+	if(gTimeSynced) {
+		if ((currentTime >= gPumpScheduleStartTime) && (currentTime < gPumpScheduleStopTime)) {
+			cmdPumpOnOff(true);
+		}
+		else {
+			cmdPumpOnOff(false);
+		}
 	}
 }
 
@@ -367,15 +481,14 @@ void checkPumpSchedule(void) {
  */
 enum mgos_app_init_result mgos_app_init(void) {
 
-//	cs_log_set_level(LL_DEBUG);					// Set log level to debug
+	// cs_log_set_level(LL_DEBUG);					// Set log level to debug
 
-	device_cfg = get_cfg();
-	printf ("mgos_app_init		Device id is: %s \r\n", device_cfg->device.id);
+	printf ("mgos_app_init Device id is: %s \r\n", mgos_sys_config_get_device_id());
 
-	if (mgos_wifi_validate_sta_cfg(&device_cfg->wifi.sta, &msg) == false) {
+	if (mgos_wifi_validate_sta_cfg(mgos_sys_config_get_wifi_sta(), &msg) == false) {
 		LOG(LL_DEBUG, ("%s\n", msg));
 	}
-	if (mgos_wifi_validate_ap_cfg(&device_cfg->wifi.ap, &msg) == false) {
+	if (mgos_wifi_validate_ap_cfg(mgos_sys_config_get_wifi_ap(), &msg) == false) {
 		LOG(LL_DEBUG, ("%s\n", msg));
 	}
 
@@ -393,7 +506,6 @@ enum mgos_app_init_result mgos_app_init(void) {
 	LOG(LL_DEBUG, ("setup timer call back : %d msec \n", CALLBACK_PERIOD));
 	mgos_set_timer(CALLBACK_PERIOD, true, periodicCallBackHandler, NULL);
 
-
 	/* Initialize ade7912 a/d converter and HSPI peripheral	*/
 	gADCConfigured = ade7912_init(eFRQ4khz);
 	LOG(LL_DEBUG, ("ade7912 initialization result: %d [1=SUCCESS, 0=FAIL] \n", gADCConfigured));
@@ -401,7 +513,10 @@ enum mgos_app_init_result mgos_app_init(void) {
 	mgos_set_timer(990, true, measurePumpTask, NULL);
 
 	/* Register AWS shadow callback handler	*/
-	mgos_aws_shadow_set_state_handler(aws_shadow_state_handler, NULL);
+  mgos_event_add_group_handler(MGOS_SHADOW_BASE, shadow_state_cb, NULL);
+
+	/* Register http_client call back	*/
+  mgos_event_add_group_handler(MGOS_EVENT_GRP_NET, http_client_connect_event, NULL);
 
 	LOG(LL_INFO, ("MGOS_APP_INIT_SUCCESS"));
   return MGOS_APP_INIT_SUCCESS;

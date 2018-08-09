@@ -1,0 +1,10 @@
+# mos.yml
+mos.yml
+
+# Pem files
+*.pem
+*.pem.key
+
+# build files
+build/
+build.txt
